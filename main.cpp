@@ -91,11 +91,13 @@ bool enableBitcrush = false;
 //bool enableOctaveDoubling = false;
 OctaveMode octaveMode = OctaveMode::Single;
 bool goofyUnison = false;
+bool enableCompressor = false;
 
 // DSP timer. Updated upon buffer completion 
 double timeAccumulator = 0.0;
 bool hasClipped = false;
 float maxAmplitude = 0.0f;
+float volume = 1.0f;
 
 Waveform currWaveFunc = W_Sine;
 
@@ -228,6 +230,14 @@ float lowpass(float& accum, float val, float q) {
     return accum;
 }
 
+float compressor(float& accum, float val, float magic) {
+    // Figure out the peak volume
+    // Maximise it
+    float peak = abs(lowpass(val, accum, magic));
+
+    return (1.0 - peak) * val;
+}
+
 // Core synth function!
 // Generates a pair of audio samples for a given voice index.
 float lLpAccum = 0.0f;
@@ -265,16 +275,28 @@ void getVoiceSample(float& lOut, float& rOut, int voiceIdx, double sampleTime) {
     lOut *= attenuation;
     rOut *= attenuation;
 
+    lOut *= volume;
+    rOut *= volume;
+
     if (enableBitcrush) {
         lOut = bitcrush(lOut, crushBits);
         rOut = bitcrush(rOut, crushBits);
     }
 
-    lOut = lowpass(lLpAccum, lOut, triangle(sampleTime, 6.5) * 0.5 + 0.5);
-    rOut = lowpass(rLpAccum, rOut, triangle(sampleTime, 6.5) * 0.5 + 0.5);
+    //lOut = lowpass(lLpAccum, lOut, triangle(sampleTime, 6.5) * 0.5 + 0.5);
+    //rOut = lowpass(rLpAccum, rOut, triangle(sampleTime, 6.5) * 0.5 + 0.5);
+    if (enableCompressor) {
+        lOut = compressor(lLpAccum, lOut, 0.05);
+        rOut = compressor(rLpAccum, rOut, 0.05);
+    }
+
 }
 
 int currentSampleRate = 44100;
+int bufSize = 512;
+
+float lastBufferL[1024];
+float lastBufferR[1024];
 
 int nChannels = 2;
 void audioCallback(void*, Uint8* data, int len) {
@@ -289,6 +311,8 @@ void audioCallback(void*, Uint8* data, int len) {
         stream[i + 1] = 0.0;
 
         for (int j = 0; j < NUM_VOICES; j++) {
+            // oversampling
+
             float l, r;
             getVoiceSample(l, r, j, sampleTime);
             l *= 0.25f;
@@ -296,6 +320,9 @@ void audioCallback(void*, Uint8* data, int len) {
             stream[i] += l;
             stream[i + 1] += r;
         } 
+
+        lastBufferL[i / nChannels] = stream[i];
+        lastBufferR[i / nChannels] = stream[i + 1];
 
         if (stream[i] > 1.0 || stream[i] < -1.0) {
             hasClipped = true;
@@ -434,6 +461,7 @@ void eventLoop() {
     Label vuLabel { "vu meter", SDL_Color { 255, 255, 255 }};
     Label waveformLabel { "waveform", SDL_Color { 255, 255, 255 }};
     Label octaveModeLabel { "octave mode", SDL_Color { 255, 255, 255 }};
+    Label clipLabel { "clipping!", SDL_Color { 255, 0, 0 }};
     Label* crushBitsLabel = new Label { "16.0" };
     double lastCrushBits = crushBits;
 
@@ -471,6 +499,8 @@ void eventLoop() {
                     unisonDetuneAmount -= 0.0001f;
                 } else if (evt.key.keysym.scancode == SDL_SCANCODE_KP_ENTER) {
                     enableBitcrush = !enableBitcrush;
+                } else if (evt.key.keysym.scancode == SDL_SCANCODE_KP_0) {
+                    enableCompressor = !enableCompressor;  
                 } else if (evt.key.keysym.scancode == SDL_SCANCODE_KP_7) {
                     crushBits += 0.1f;
                     crushBits = clamp(crushBits, 1.0, 31.0);
@@ -484,6 +514,10 @@ void eventLoop() {
                     }
                 } else if (evt.key.keysym.scancode == SDL_SCANCODE_KP_DIVIDE) {
                     goofyUnison = !goofyUnison;
+                } else if (evt.key.keysym.scancode == SDL_SCANCODE_UP) {
+                    volume += 0.1f;
+                } else if (evt.key.keysym.scancode == SDL_SCANCODE_DOWN) {
+                    volume -= 0.1f;
                 }
             }
 
@@ -573,6 +607,23 @@ void eventLoop() {
         SDL_RenderDrawLines(renderer, wPoints, 128);
         waveformLabel.draw(40, 400 - 50); 
 
+        SDL_Point oscPointsL[bufSize];
+        SDL_Point oscPointsR[bufSize];
+
+        for (int i = 0; i < bufSize; i++) {
+            oscPointsL[i].x = i + 40;
+            oscPointsL[i].y = (lastBufferL[i] * 100) + 480;
+        }
+
+
+        for (int i = 0; i < bufSize; i++) {
+            oscPointsR[i].x = i + 40;
+            oscPointsR[i].y = (lastBufferR[i] * 100) + 580;
+        }
+
+        SDL_RenderDrawLines(renderer, oscPointsL, bufSize);
+        SDL_RenderDrawLines(renderer, oscPointsR, bufSize);
+
         // clipping indicator
         SDL_SetRenderDrawColor(renderer, 255, 0, 0, 255);
         SDL_Rect clipRect;
@@ -580,8 +631,10 @@ void eventLoop() {
         clipRect.y = 500;
         clipRect.w = 64;
         clipRect.h = 64;
-        if (hasClipped)
+        if (hasClipped) {
             SDL_RenderFillRect(renderer, &clipRect);
+            clipLabel.draw(64, 594);
+        }
 
         if (unisonDetune) {
             SDL_SetRenderDrawColor(renderer, 0, 255, 0, 255);
@@ -658,7 +711,7 @@ int main(int argc, char** argv) {
     font = TTF_OpenFont("font.ttf", 20);
     SDL_AudioSpec want;
     want.format = AUDIO_F32;
-    want.samples = 512;
+    want.samples = bufSize;
     want.freq = 44100; 
     want.userdata = nullptr;
     want.channels = nChannels;
@@ -669,6 +722,7 @@ int main(int argc, char** argv) {
 
     SDL_OpenAudio(&want, &got);
 
+    bufSize = got.samples;
     currentSampleRate = got.freq;
     nChannels = got.channels;
     SDL_PauseAudio(0);
