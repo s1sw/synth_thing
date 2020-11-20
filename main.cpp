@@ -270,8 +270,6 @@ void getVoiceSample(float& lOut, float& rOut, int voiceIdx, double sampleTime) {
         rOut = bitcrush(rOut, crushBits);
     }
 
-    lOut = lowpass(lLpAccum, lOut, triangle(sampleTime, 6.5) * 0.5 + 0.5);
-    rOut = lowpass(rLpAccum, rOut, triangle(sampleTime, 6.5) * 0.5 + 0.5);
 }
 
 int currentSampleRate = 44100;
@@ -419,13 +417,13 @@ struct Label {
     SDL_Texture* texture;
 };
 
+
+int offset = 0;
+
 void eventLoop() {
-    int offset = 0;
     bool exit = false;
 
-    double lastTime = SDL_GetPerformanceCounter() / (double)SDL_GetPerformanceFrequency();
-    timeAccumulator = lastTime;
-    SDL_Surface* nameMsg = TTF_RenderText_Solid(font, "Someone Somewhere's Super Speedy Software Synthesiser", SDL_Color { 255, 255, 255 });
+    SDL_Surface* nameMsg = TTF_RenderText_Solid(font, "Someone Somewhere's Super Simple Software Synthesiser", SDL_Color { 255, 255, 255 });
     SDL_Texture* nameTex = SDL_CreateTextureFromSurface(renderer, nameMsg);
 
     SDL_Surface* crushLabelMsg = TTF_RenderText_Solid(font, "bitcrush", SDL_Color { 255, 255, 255 });
@@ -436,6 +434,9 @@ void eventLoop() {
     Label octaveModeLabel { "octave mode", SDL_Color { 255, 255, 255 }};
     Label* crushBitsLabel = new Label { "16.0" };
     double lastCrushBits = crushBits;
+
+    double lastTime = SDL_GetPerformanceCounter() / (double)SDL_GetPerformanceFrequency();
+    timeAccumulator = lastTime;
 
     while (!exit) {
         SDL_Event evt;
@@ -653,13 +654,42 @@ void eventLoop() {
     }
 }
 
+void midiCallback(double deltatime, std::vector< unsigned char >* message, void* userData) {
+    unsigned int nBytes = message->size();
+
+    if (nBytes == 3) {
+        if (message->at(0) == 144) {
+            int newNote = message->at(1);
+            int newVel = message->at(2);
+
+            double currTime = timeAccumulator;//SDL_GetPerformanceCounter() / (double)SDL_GetPerformanceFrequency();
+            if (message->at(2) != 0) {
+                setNoteOn(message->at(1) + offset, currTime);
+                int oOffset = 0;
+                for (int i = 0; i < (int)octaveMode; i++) {
+                    oOffset += 12;
+                    setNoteOn(message->at(1) + oOffset + offset, currTime);
+                }
+            } else {
+                setNoteOff(message->at(1) + offset, currTime);
+                int oOffset = 0;
+                for (int i = 0; i < (int)octaveMode; i++) {
+                    oOffset += 12;
+                    setNoteOff(message->at(1) + oOffset + offset, currTime);
+                }
+            }
+        }
+    }
+}
+
 int main(int argc, char** argv) {
+    SDL_Init(SDL_INIT_EVERYTHING);
     TTF_Init();
     font = TTF_OpenFont("font.ttf", 20);
     SDL_AudioSpec want;
     want.format = AUDIO_F32;
     want.samples = 512;
-    want.freq = 44100; 
+    want.freq = 48000; 
     want.userdata = nullptr;
     want.channels = nChannels;
     want.callback = audioCallback;
@@ -667,14 +697,30 @@ int main(int argc, char** argv) {
 
     SDL_AudioSpec got;
 
-    SDL_OpenAudio(&want, &got);
+    auto devId = SDL_OpenAudioDevice(nullptr, 0, &want, &got, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
+
+    if (devId == 0) {
+        fprintf(stderr, "failed to open audio device: %s\n", SDL_GetError()); 
+    }
 
     currentSampleRate = got.freq;
     nChannels = got.channels;
-    SDL_PauseAudio(0);
 
     window = SDL_CreateWindow("win", 0, 0, 800, 600, SDL_WINDOW_RESIZABLE);
     renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
 
+    RtMidiIn* midiin = new RtMidiIn();
+
+    if (midiin->getPortCount()) {
+        for (int i = 0; i < midiin->getPortCount(); i++) {
+            printf("port %i: %s\n", i, midiin->getPortName(i).c_str());
+        }
+        midiin->openPort(1);
+        midiin->setCallback(midiCallback);
+    } else {
+        fprintf(stderr, "no midi ports!");
+    }
+
+    SDL_PauseAudioDevice(devId, 0);
     eventLoop();
 }
