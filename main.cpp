@@ -92,6 +92,8 @@ bool enableBitcrush = false;
 OctaveMode octaveMode = OctaveMode::Single;
 bool goofyUnison = false;
 bool enableCompressor = false;
+float lpQ = 0.5f;
+bool lpEnabled = false;
 
 // DSP timer. Updated upon buffer completion 
 double timeAccumulator = 0.0;
@@ -283,8 +285,11 @@ void getVoiceSample(float& lOut, float& rOut, int voiceIdx, double sampleTime) {
         rOut = bitcrush(rOut, crushBits);
     }
 
-    //lOut = lowpass(lLpAccum, lOut, triangle(sampleTime, 6.5) * 0.5 + 0.5);
-    //rOut = lowpass(rLpAccum, rOut, triangle(sampleTime, 6.5) * 0.5 + 0.5);
+    if (lpEnabled) {
+        lOut = lowpass(lLpAccum, lOut, lpQ);
+        rOut = lowpass(rLpAccum, rOut, lpQ);
+    }
+
     if (enableCompressor) {
         lOut = compressor(lLpAccum, lOut, 0.05);
         rOut = compressor(rLpAccum, rOut, 0.05);
@@ -445,6 +450,14 @@ struct Label {
     SDL_Texture* texture;
 };
 
+// val is assumed to go 0-1!
+void drawDial(int x, int y, float val, int radius) {
+    int fX = x + (cosf(val * M_PI) * radius);
+    int fY = y - (sinf(val * M_PI) * radius);
+
+    SDL_RenderDrawLine(renderer, x, y, fX, fY);
+}
+
 
 int offset = 0;
 
@@ -461,6 +474,7 @@ void eventLoop() {
     Label waveformLabel { "waveform", SDL_Color { 255, 255, 255 }};
     Label octaveModeLabel { "octave mode", SDL_Color { 255, 255, 255 }};
     Label clipLabel { "clipping!", SDL_Color { 255, 0, 0 }};
+    Label lowpassLabel { "lowpass", SDL_Color { 255, 255, 255 }};
     Label* crushBitsLabel = new Label { "16.0" };
     double lastCrushBits = crushBits;
 
@@ -520,7 +534,14 @@ void eventLoop() {
                     volume += 0.1f;
                 } else if (evt.key.keysym.scancode == SDL_SCANCODE_DOWN) {
                     volume -= 0.1f;
+                } else if (evt.key.keysym.scancode == SDL_SCANCODE_KP_5) {
+                    lpEnabled = !lpEnabled;
+                } else if (evt.key.keysym.scancode == SDL_SCANCODE_KP_3) {
+                    lpQ += 0.01f;
+                } else if (evt.key.keysym.scancode == SDL_SCANCODE_KP_PERIOD) {
+                    lpQ -= 0.01f;
                 }
+                lpQ = clamp(lpQ, 0.0f, 1.0f);
             }
 
             auto noteIt = freqs.find(evt.key.keysym.scancode);
@@ -650,16 +671,9 @@ void eventLoop() {
 
         if (enableBitcrush) {
             SDL_SetRenderDrawColor(renderer, 255, 0, 0, 0);
-            SDL_Rect bitcrushRect;
-            bitcrushRect.x = 128 + 4 + 72;
-            bitcrushRect.y = 500 + (16 * 16);
-            bitcrushRect.w = 64;
-            bitcrushRect.h = -(16 * crushBits);
-            SDL_RenderFillRect(renderer, &bitcrushRect);
-
             SDL_Rect labelRect;
-            labelRect.x = 128 + 4 + 72;
-            labelRect.y = 480;
+            labelRect.x = 20;
+            labelRect.y = 706;
             labelRect.w = crushLabelMsg->w;
             labelRect.h = crushLabelMsg->h;
             SDL_RenderCopy(renderer, crushLabelTex, nullptr, &labelRect);
@@ -672,7 +686,14 @@ void eventLoop() {
                 lastCrushBits = crushBits;
             }
 
-            crushBitsLabel->draw(128 + 4 + 72, 500 + 16 * 16);
+            crushBitsLabel->draw(20, 756);
+
+            drawDial(20 + 15, 756, (crushBits - 1.0f) / 15.0f, 30);
+        }
+
+        if (lpEnabled) {
+            lowpassLabel.draw(50, 756);
+            drawDial(50 + 15, 756, lpQ, 30);
         }
 
         {
@@ -708,15 +729,27 @@ void eventLoop() {
     }
 }
 
+enum MsgType {
+    M_NoteOff = 0, 
+    M_NoteOn = 1
+};
+
 void midiCallback(double deltatime, std::vector< unsigned char >* message, void* userData) {
     unsigned int nBytes = message->size();
 
+    const unsigned char channelMask = 0b00001111;
+    const unsigned char typeMask = 0b01110000;
+
+    uint8_t channel = message->at(0) & channelMask;
+    uint8_t type = (message->at(0) & typeMask) >> 4;
+    printf("msg: channel %i, type %i\n", channel, type);
+
     if (nBytes == 3) {
-        if (message->at(0) == 144) {
+        if (type == M_NoteOn) {
             int newNote = message->at(1);
             int newVel = message->at(2);
 
-            double currTime = timeAccumulator;//SDL_GetPerformanceCounter() / (double)SDL_GetPerformanceFrequency();
+            double currTime = timeAccumulator;
             if (message->at(2) != 0) {
                 setNoteOn(message->at(1) + offset, currTime);
                 int oOffset = 0;
@@ -724,13 +757,16 @@ void midiCallback(double deltatime, std::vector< unsigned char >* message, void*
                     oOffset += 12;
                     setNoteOn(message->at(1) + oOffset + offset, currTime);
                 }
-            } else {
-                setNoteOff(message->at(1) + offset, currTime);
-                int oOffset = 0;
-                for (int i = 0; i < (int)octaveMode; i++) {
-                    oOffset += 12;
-                    setNoteOff(message->at(1) + oOffset + offset, currTime);
-                }
+            } 
+            printf("midi note on! velocity: %i, note: %i\n", newVel, newNote);
+        }
+
+        if (type == M_NoteOff) {
+            setNoteOff(message->at(1) + offset, timeAccumulator);
+            int oOffset = 0;
+            for (int i = 0; i < (int)octaveMode; i++) {
+                oOffset += 12;
+                setNoteOff(message->at(1) + oOffset + offset, timeAccumulator);
             }
         }
     }
@@ -766,7 +802,7 @@ int main(int argc, char** argv) {
 
     RtMidiIn* midiin = new RtMidiIn();
 
-    if (midiin->getPortCount()) {
+    if (midiin->getPortCount() > 1) {
         for (int i = 0; i < midiin->getPortCount(); i++) {
             printf("port %i: %s\n", i, midiin->getPortName(i).c_str());
         }
