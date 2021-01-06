@@ -1,14 +1,25 @@
 // Polysynth
 // =========
 
+#define SDL_MAIN_HANDLED
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_render.h>
 #include <SDL2/SDL_scancode.h>
 #include <unordered_map>
 #include <SDL2/SDL_audio.h>
+#ifdef _WIN32
+#define _USE_MATH_DEFINES
+#endif
 #include <math.h>
 #include <SDL2/SDL_ttf.h>
+#ifdef _WIN32
+#include <RtMidi.h>
+#else
 #include <rtmidi/RtMidi.h>
+#endif
+#include <thread>
+
+
 
 // Types
 // =====
@@ -100,6 +111,7 @@ double timeAccumulator = 0.0;
 bool hasClipped = false;
 float maxAmplitude = 0.0f;
 float volume = 1.0f;
+double pitchBendAmt = 0.0;
 
 Waveform currWaveFunc = W_Sine;
 
@@ -246,6 +258,7 @@ float lLpAccum = 0.0f;
 float rLpAccum = 0.0f;
 void getVoiceSample(float& lOut, float& rOut, int voiceIdx, double sampleTime) {
     auto& v = voices[voiceIdx];
+    double freq = pitch(v.note + pitchBendAmt);
 
     lOut = 0.0f;
     rOut = 0.0f;
@@ -256,9 +269,9 @@ void getVoiceSample(float& lOut, float& rOut, int voiceIdx, double sampleTime) {
     double waveSamp = 0.0;
 
     if (unisonDetune) {
-        doUnisonDetune(lOut, rOut, sampleTime, v.freq, waveFuncs[currWaveFunc]);
+        doUnisonDetune(lOut, rOut, sampleTime, freq, waveFuncs[currWaveFunc]);
     } else {
-        lOut = waveFuncs[currWaveFunc](sampleTime, v.freq);
+        lOut = waveFuncs[currWaveFunc](sampleTime,  freq);
         rOut = lOut;
     }
 
@@ -630,8 +643,8 @@ void eventLoop() {
         SDL_RenderDrawLines(renderer, wPoints, 128);
         waveformLabel.draw(40, 400 - 50); 
 
-        SDL_Point oscPointsL[bufSize];
-        SDL_Point oscPointsR[bufSize];
+        static SDL_Point* oscPointsL = (SDL_Point*)malloc(sizeof(SDL_Point) * bufSize);
+        static SDL_Point* oscPointsR = (SDL_Point*)malloc(sizeof(SDL_Point) * bufSize);
 
         for (int i = 0; i < bufSize; i++) {
             oscPointsL[i].x = i + 40;
@@ -731,7 +744,12 @@ void eventLoop() {
 
 enum MsgType {
     M_NoteOff = 0, 
-    M_NoteOn = 1
+    M_NoteOn = 1,
+    M_AftertouchPolyphonic = 2,
+    M_ControlChange = 3,
+    M_ProgramChange = 4,
+    M_AftertouchChannel = 5,
+    M_PitchBend = 6
 };
 
 void midiCallback(double deltatime, std::vector< unsigned char >* message, void* userData) {
@@ -769,6 +787,67 @@ void midiCallback(double deltatime, std::vector< unsigned char >* message, void*
                 setNoteOff(message->at(1) + oOffset + offset, timeAccumulator);
             }
         }
+
+        if (type == M_ControlChange) {
+            printf("set cc %i to %i\n", message->at(1), message->at(2));
+
+            if (message->at(1) == 28) {
+                crushBits = 16.0f - ((message->at(2) / 127.0f) * 16.0f);
+            }
+
+            if (message->at(1) == 21) {
+                volume = (message->at(2) / 127.0f) * 2.0f;
+            }
+
+            if (message->at(1) == 22) {
+                unisonDetuneAmount = (message->at(2) / 127.0f) * 0.005f;
+            }
+        }
+
+        if (type == M_PitchBend) {
+            // pitch bend uses 14 bits for some reason
+            int val = (message->at(1) & 0b01111111) |
+                      ((message->at(2) & 0b01111111) << 7);
+            pitchBendAmt = (((double)val) / 16384.0) - 0.5;
+            printf("pitch bend: %f\n", pitchBendAmt);
+
+        }
+    }
+}
+
+void fancyThread(RtMidiOut* launchkeyOut) {
+    while (true) {
+        for (int i = 0; i < 8; i++) {
+            bool on = ((maxAmplitude - (i * 0.125f)) > 0);
+            int vel = on ? 21 : 0;
+
+            if (i >= 5) {
+                vel = on ? 13 : 0;
+            }
+
+            if (i == 7) {
+                vel = on ? 5 : 0;
+            }
+            unsigned char msg2[] = { 0b10010000, i + 96, vel };
+            launchkeyOut->sendMessage(msg2, 3);
+        }
+
+        for (int i = 0; i < 8; i++) {
+            bool on = ((maxAmplitude - (i * 0.125f)) > 0);
+            int vel = on ? 21 : 0;
+
+            if (i >= 5) {
+                vel = on ? 13 : 0;
+            }
+
+            if (i == 7) {
+                vel = on ? 5 : 0;
+            }
+            unsigned char msg2[] = { 0b10010000, i + 112, vel };
+            launchkeyOut->sendMessage(msg2, 3);
+        }
+
+        SDL_Delay(50);
     }
 }
 
@@ -797,10 +876,11 @@ int main(int argc, char** argv) {
     currentSampleRate = got.freq;
     nChannels = got.channels;
 
-    window = SDL_CreateWindow("win", 0, 0, 800, 600, SDL_WINDOW_RESIZABLE);
+    window = SDL_CreateWindow("win", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 800, 600, SDL_WINDOW_RESIZABLE);
     renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
 
     RtMidiIn* midiin = new RtMidiIn();
+    RtMidiOut* launchkeyOut = new RtMidiOut();
 
     if (midiin->getPortCount() > 1) {
         for (int i = 0; i < midiin->getPortCount(); i++) {
@@ -812,6 +892,24 @@ int main(int argc, char** argv) {
         fprintf(stderr, "no midi ports!");
     }
 
+    if (launchkeyOut->getPortCount() > 1) {
+        for (int i = 0; i < launchkeyOut->getPortCount(); i++) {
+            printf("out port %i: %s\n", i, launchkeyOut->getPortName(i).c_str());
+        }
+        launchkeyOut->openPort(4);
+
+        unsigned char msg[] = { 0b10011111, 12, 0b01111111 };
+
+        launchkeyOut->sendMessage(msg, 3);
+
+        std::thread([&]() {fancyThread(launchkeyOut); }).detach();
+    }
+
     SDL_PauseAudioDevice(devId, 0);
     eventLoop();
+
+    unsigned char msg[] = { 0b10011111, 12, 0 };
+    launchkeyOut->sendMessage(msg, 3);
+
+    return 0;
 }
